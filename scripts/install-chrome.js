@@ -15,13 +15,32 @@ async function main() {
   console.log('PUPPETEER_CACHE_DIR =', cacheDir);
   console.log('cwd =', process.cwd());
 
-  // buildId pinned dal puppeteer locale (es. 131.0.6778.204).
-  let buildId = 'latest';
+  // buildId pinned dal puppeteer locale (es. 131.0.6778.204). 'latest' NON
+  // è un buildId valido per l'URL di download (dà 404): serve la revision esatta.
+  let buildId = null;
   try {
     const puppeteer = require('puppeteer');
-    buildId = (puppeteer.configuration && puppeteer.configuration.browserRevision) || 'latest';
+    if (puppeteer.configuration && puppeteer.configuration.browserRevision) {
+      buildId = puppeteer.configuration.browserRevision;
+    }
   } catch (err) {
-    console.warn('puppeteer not loadable, using latest:', String(err.message));
+    console.warn('puppeteer not loadable:', String(err.message));
+  }
+  if (!buildId) {
+    // Fallback: legge la revision pinned dal puppeteer-core locale.
+    const revPath = path.join(process.cwd(), 'node_modules', 'puppeteer-core', 'lib', 'cjs', 'puppeteer', 'revisions.js');
+    try {
+      const src = fs.readFileSync(revPath, 'utf8');
+      const m = src.match(/chrome\s*:\s*'([^']+)'/);
+      if (m) buildId = m[1];
+    } catch (err) {
+      console.warn('revisions.js not readable:', String(err.message));
+    }
+  }
+  if (!buildId) {
+    // Ultimo fallback: chiede a @puppeteer/browsers la revisione stabile nota.
+    const { resolveBuildId } = require('@puppeteer/browsers');
+    buildId = await resolveBuildId('chrome', 'linux', 'latest');
   }
   console.log('buildId =', buildId);
 
