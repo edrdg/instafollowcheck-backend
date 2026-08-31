@@ -3,6 +3,7 @@
 // Puppeteer) e valida ogni richiesta col JWT dell'utente Supabase.
 const express = require('express');
 const http = require('http');
+const path = require('path');
 const cors = require('cors');
 const { EventEmitter } = require('events');
 const { WebSocketServer } = require('ws');
@@ -13,6 +14,7 @@ puppeteer.use(StealthPlugin());
 
 const PORT = Number(process.env.PORT) || 3000;
 
+// ----- Supabase (per autenticare il JWT dell'utente) -----
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || '')
@@ -31,7 +33,7 @@ function decodeExp(token) {
   }
 }
 
-const tokenCache = new Map();
+const tokenCache = new Map(); // token -> { user, until }
 async function verifyToken(token) {
   if (!token) return null;
   const now = Date.now();
@@ -42,7 +44,10 @@ async function verifyToken(token) {
     const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
     });
-    if (!resp.ok) { tokenCache.delete(token); return null; }
+    if (!resp.ok) {
+      tokenCache.delete(token);
+      return null;
+    }
     const user = await resp.json();
     const exp = decodeExp(token);
     const ttl = exp ? exp * 1000 - now : 600000;
@@ -69,6 +74,9 @@ async function requireAuth(req, res, next) {
   next();
 }
 
+// ---------------------------------------------------------------------------
+// Timing di analisi (stessi default del progetto, override via env CF_*).
+// ---------------------------------------------------------------------------
 const CONFIG = {
   pageLoadMs: Number(process.env.CF_PAGE_LOAD_MS) || 1500,
   dialogOpenMs: Number(process.env.CF_DIALOG_OPEN_MS) || 1000,
@@ -84,8 +92,32 @@ app.use(cors({ origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGIN.length
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
+// Diagnostica deploy: mostra dove puppeteer cerca Chrome e se esiste.
+app.get('/api/debug', requireAuth, async (req, res) => {
+  try {
+    const fs = require('fs');
+    const puppeteer = require('puppeteer');
+    let exe = null;
+    try { exe = puppeteer.executablePath(); } catch (e) { exe = 'ERR: ' + ((e && e.message) || e); }
+    const cacheDir = process.env.PUPPETEER_CACHE_DIR || null;
+    const check = (p) => (p ? fs.existsSync(p) : null);
+    res.json({
+      cacheDir,
+      executablePath: exe,
+      exists: typeof exe === 'string' ? check(exe) : null,
+      home: process.env.HOME || null,
+      cwd: process.cwd(),
+      nodeModules: check(require('path').join(process.cwd(), 'node_modules')),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
+  }
+});
+
 const broker = new EventEmitter();
-function emit(type, data = {}) { broker.emit('event', { type, ...data }); }
+function emit(type, data = {}) {
+  broker.emit('event', { type, ...data });
+}
 
 let browser = null;
 let page = null;
@@ -104,7 +136,12 @@ async function getBrowser() {
   if (browser && browser.connected) return browser;
   browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
     defaultViewport: { width: 1100, height: 760 },
   });
   page = await browser.newPage();
@@ -209,6 +246,7 @@ async function profileCounts() {
   });
 }
 
+// ----- API -----
 app.post('/api/open', requireAuth, async (req, res) => {
   try {
     await getBrowser();
@@ -462,6 +500,7 @@ async function collectNames(selfUser) {
   }, selfUser);
 }
 
+// ----- WebSocket: screencast embed + relay input -----
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
