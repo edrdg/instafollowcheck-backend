@@ -7,6 +7,7 @@ const path = require('path');
 const cors = require('cors');
 const { EventEmitter } = require('events');
 const { WebSocketServer } = require('ws');
+const fs = require('fs');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
@@ -95,7 +96,6 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 // Diagnostica deploy: mostra dove puppeteer cerca Chrome e se esiste.
 app.get('/api/debug', requireAuth, async (req, res) => {
   try {
-    const fs = require('fs');
     const puppeteer = require('puppeteer');
     let exe = null;
     try { exe = puppeteer.executablePath(); } catch (e) { exe = 'ERR: ' + ((e && e.message) || e); }
@@ -107,7 +107,7 @@ app.get('/api/debug', requireAuth, async (req, res) => {
       exists: typeof exe === 'string' ? check(exe) : null,
       home: process.env.HOME || null,
       cwd: process.cwd(),
-      nodeModules: check(require('path').join(process.cwd(), 'node_modules')),
+      nodeModules: check(path.join(process.cwd(), 'node_modules')),
     });
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
@@ -132,8 +132,46 @@ function broadcast(type, data = {}) {
 }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// Assicura che l'eseguibile di Chrome esista; se manca (es. immagine Render
+// senza la cache di build), lo scarica a runtime prima di lanciare il browser.
+async function ensureChrome() {
+  try {
+    const pp = require('puppeteer');
+    const exe = pp.executablePath();
+    if (exe && fs.existsSync(exe)) return exe;
+    const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', 'puppeteer-cache');
+    console.log('Chrome mancante — download in corso in', cacheDir);
+    const { install } = require('@puppeteer/browsers');
+    let buildId = null;
+    try { buildId = (pp.configuration && pp.configuration.browserRevision) || null; } catch (_) {}
+    if (!buildId) {
+      const revPath = path.join(process.cwd(), 'node_modules', 'puppeteer-core', 'lib', 'cjs', 'puppeteer', 'revisions.js');
+      try {
+        const m = fs.readFileSync(revPath, 'utf8').match(/chrome\s*:\s*'([^']+)'/);
+        if (m) buildId = m[1];
+      } catch (_) {}
+    }
+    if (!buildId) {
+      const { resolveBuildId } = require('@puppeteer/browsers');
+      buildId = await resolveBuildId('chrome', 'linux', 'latest');
+    }
+    const installed = await install({
+      browser: 'chrome',
+      buildId,
+      cacheDir,
+      baseUrl: 'https://storage.googleapis.com/chrome-for-testing-public',
+    });
+    console.log('Chrome installato a', installed.executablePath);
+    return installed.executablePath;
+  } catch (err) {
+    console.error('ensureChrome error:', String((err && err.message) || err));
+    return null;
+  }
+}
+
 async function getBrowser() {
   if (browser && browser.connected) return browser;
+  await ensureChrome();
   browser = await puppeteer.launch({
     headless: 'new',
     args: [
