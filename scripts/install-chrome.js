@@ -1,51 +1,67 @@
-// Installa Chromium per Puppeteer durante la build di Render, con output
-// verboso e verifica finale. Se fallisce, la build fallisce con un messaggio
-// chiaro nei log (invece di passare silenziosamente senza Chrome).
-const { execSync } = require('child_process');
+// Installa Chromium per Puppeteer DURANTE la build di Render, usando l'API
+// locale di @puppeteer/browsers (dipendenza del puppeteer installato) e la
+// buildId ESATTA pinnata da puppeteer-core.
+//
+// Perché non npx: `npx puppeteer browsers install chrome` può risolvere una
+// versione REMOTA di puppeteer (più recente) che scarica un'altra build di
+// Chrome in una cartella diversa, lasciando il puppeteer locale senza browser.
+const { install } = require('@puppeteer/browsers');
 const fs = require('fs');
 const path = require('path');
 
-console.log('--- install-chrome: starting ---');
-console.log('PUPPETEER_CACHE_DIR =', process.env.PUPPETEER_CACHE_DIR || '(not set)');
-console.log('cwd =', process.cwd());
-console.log('puppeteer config =', fs.existsSync(path.join(process.cwd(), 'puppeteer.config.cjs')) ? 'present' : 'MISSING');
+async function main() {
+  console.log('--- install-chrome: starting ---');
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', '.cache', 'puppeteer');
+  console.log('PUPPETEER_CACHE_DIR =', cacheDir);
+  console.log('cwd =', process.cwd());
 
-// Pulisce eventuali download corrotti/incompleti da build precedenti:
-// puppeteer vede la cartella esistente e NON riscarica, quindi la rimuoviamo.
-const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', '.cache', 'puppeteer');
-if (fs.existsSync(cacheDir)) {
-  console.log('cleaning existing puppeteer cache:', cacheDir);
-  fs.rmSync(cacheDir, { recursive: true, force: true });
-}
+  // buildId pinned dal puppeteer locale (es. 131.0.6778.204).
+  let buildId = 'latest';
+  try {
+    const puppeteer = require('puppeteer');
+    buildId = (puppeteer.configuration && puppeteer.configuration.browserRevision) || 'latest';
+  } catch (err) {
+    console.warn('puppeteer not loadable, using latest:', String(err.message));
+  }
+  console.log('buildId =', buildId);
 
-try {
-  const out = execSync('npx puppeteer browsers install chrome', {
-    stdio: 'inherit',
-    env: process.env,
-    cwd: process.cwd(),
+  // Pulisce download corrotti/incompleti da build precedenti (puppeteer non
+  // riscarica se la cartella esiste anche senza eseguibile).
+  if (fs.existsSync(cacheDir)) {
+    console.log('cleaning existing puppeteer cache:', cacheDir);
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+
+  const installed = await install({
+    browser: 'chrome',
+    buildId,
+    cacheDir,
+    baseUrl: 'https://storage.googleapis.com/chrome-for-testing-public',
   });
-  console.log('--- install-chrome: command finished ---');
-} catch (err) {
-  console.error('--- install-chrome: FAILED ---');
-  console.error(err.stderr ? String(err.stderr) : String(err.message));
-  process.exit(1);
-}
+  console.log('installed at =', installed.executablePath);
+  console.log('exists =', fs.existsSync(installed.executablePath));
 
-// Verifica: il path dell'eseguibile esiste davvero?
-try {
-  const puppeteer = require('puppeteer');
-  const exe = puppeteer.executablePath();
-  const ok = fs.existsSync(exe);
-  console.log('executablePath =', exe);
-  console.log('exists =', ok);
-  if (!ok) {
-    console.error('--- install-chrome: executable missing after install ---');
+  // Verifica finale dal punto di vista del puppeteer locale.
+  try {
+    const puppeteer = require('puppeteer');
+    const exe = puppeteer.executablePath();
+    console.log('puppeteer.executablePath() =', exe);
+    console.log('matches =', fs.existsSync(exe));
+    if (!fs.existsSync(exe)) {
+      console.error('--- install-chrome: FAILED: puppeteer cannot find its executable ---');
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error('--- install-chrome: verification error ---');
+    console.error(String((err && err.message) || err));
     process.exit(1);
   }
-} catch (err) {
-  console.error('--- install-chrome: verification error ---');
-  console.error(String((err && err.message) || err));
-  process.exit(1);
+
+  console.log('--- install-chrome: OK ---');
 }
 
-console.log('--- install-chrome: OK ---');
+main().catch((err) => {
+  console.error('--- install-chrome: FAILED ---');
+  console.error(String((err && err.message) || err));
+  process.exit(1);
+});
