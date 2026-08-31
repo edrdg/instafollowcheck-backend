@@ -11,7 +11,7 @@ const path = require('path');
 
 async function main() {
   console.log('--- install-chrome: starting ---');
-  const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', '.cache', 'puppeteer');
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', 'puppeteer-cache');
   console.log('PUPPETEER_CACHE_DIR =', cacheDir);
   console.log('cwd =', process.cwd());
 
