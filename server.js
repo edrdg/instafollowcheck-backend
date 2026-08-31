@@ -163,6 +163,14 @@ async function ensureChrome() {
       buildId = await resolveBuildId('chrome', 'linux', 'latest');
     }
     console.log('ensureChrome: buildId =', buildId);
+    // @puppeteer/browsers install() NON riscarica se la cartella della build
+    // esiste ma l'eseguibile manca (download parziale finito nell'immagine).
+    // In quel caso pulisci la cache e riparti da zero.
+    const exePath = require('path').join(cacheDir, 'chrome', `linux-${buildId}`, 'chrome-linux64', 'chrome');
+    if (fs.existsSync(cacheDir) && !fs.existsSync(exePath)) {
+      console.log('ensureChrome: cache parziale/corrotta — pulizia di', cacheDir);
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
     const installed = await install({
       browser: 'chrome',
       buildId,
