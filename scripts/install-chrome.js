@@ -10,6 +10,14 @@ console.log('PUPPETEER_CACHE_DIR =', process.env.PUPPETEER_CACHE_DIR || '(not se
 console.log('cwd =', process.cwd());
 console.log('puppeteer config =', fs.existsSync(path.join(process.cwd(), 'puppeteer.config.cjs')) ? 'present' : 'MISSING');
 
+// Pulisce eventuali download corrotti/incompleti da build precedenti:
+// puppeteer vede la cartella esistente e NON riscarica, quindi la rimuoviamo.
+const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', '.cache', 'puppeteer');
+if (fs.existsSync(cacheDir)) {
+  console.log('cleaning existing puppeteer cache:', cacheDir);
+  fs.rmSync(cacheDir, { recursive: true, force: true });
+}
+
 try {
   const out = execSync('npx puppeteer browsers install chrome', {
     stdio: 'inherit',
