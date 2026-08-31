@@ -96,6 +96,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 // Diagnostica deploy: mostra dove puppeteer cerca Chrome e se esiste.
 app.get('/api/debug', requireAuth, async (req, res) => {
   try {
+    const fs = require('fs');
     const puppeteer = require('puppeteer');
     let exe = null;
     try { exe = puppeteer.executablePath(); } catch (e) { exe = 'ERR: ' + ((e && e.message) || e); }
@@ -107,7 +108,7 @@ app.get('/api/debug', requireAuth, async (req, res) => {
       exists: typeof exe === 'string' ? check(exe) : null,
       home: process.env.HOME || null,
       cwd: process.cwd(),
-      nodeModules: check(path.join(process.cwd(), 'node_modules')),
+      nodeModules: check(require('path').join(process.cwd(), 'node_modules')),
     });
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
@@ -134,18 +135,24 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // Assicura che l'eseguibile di Chrome esista; se manca (es. immagine Render
 // senza la cache di build), lo scarica a runtime prima di lanciare il browser.
+let chromeReady = null;
 async function ensureChrome() {
-  try {
+  // Se un download è già in corso (o già riuscito), riusa la stessa promessa.
+  if (chromeReady) return chromeReady;
+  chromeReady = (async () => {
     const pp = require('puppeteer');
-    const exe = pp.executablePath();
+    // NB: puppeteer.executablePath() LANCIA quando il browser manca (non ritorna
+    // un path) — per questo va in try/catch separato e si procede al download.
+    let exe = null;
+    try { exe = pp.executablePath(); } catch (_) { exe = null; }
     if (exe && fs.existsSync(exe)) return exe;
-    const cacheDir = process.env.PUPPETEER_CACHE_DIR || path.join(process.cwd(), 'node_modules', 'puppeteer-cache');
+    const cacheDir = process.env.PUPPETEER_CACHE_DIR || require('path').join(process.cwd(), 'node_modules', 'puppeteer-cache');
     console.log('Chrome mancante — download in corso in', cacheDir);
     const { install } = require('@puppeteer/browsers');
     let buildId = null;
     try { buildId = (pp.configuration && pp.configuration.browserRevision) || null; } catch (_) {}
     if (!buildId) {
-      const revPath = path.join(process.cwd(), 'node_modules', 'puppeteer-core', 'lib', 'cjs', 'puppeteer', 'revisions.js');
+      const revPath = require('path').join(process.cwd(), 'node_modules', 'puppeteer-core', 'lib', 'cjs', 'puppeteer', 'revisions.js');
       try {
         const m = fs.readFileSync(revPath, 'utf8').match(/chrome\s*:\s*'([^']+)'/);
         if (m) buildId = m[1];
@@ -155,25 +162,30 @@ async function ensureChrome() {
       const { resolveBuildId } = require('@puppeteer/browsers');
       buildId = await resolveBuildId('chrome', 'linux', 'latest');
     }
+    console.log('ensureChrome: buildId =', buildId);
     const installed = await install({
       browser: 'chrome',
       buildId,
       cacheDir,
       baseUrl: 'https://storage.googleapis.com/chrome-for-testing-public',
     });
-    console.log('Chrome installato a', installed.executablePath);
+    console.log('ensureChrome: installato a', installed.executablePath, '| exists =', fs.existsSync(installed.executablePath));
     return installed.executablePath;
-  } catch (err) {
+  })();
+  chromeReady.catch((err) => {
     console.error('ensureChrome error:', String((err && err.message) || err));
-    return null;
-  }
+    chromeReady = null; // consente un nuovo tentativo al prossimo giro
+  });
+  return chromeReady;
 }
 
 async function getBrowser() {
   if (browser && browser.connected) return browser;
-  await ensureChrome();
+  const exe = await ensureChrome();
+  if (!exe) throw new Error('Chrome non disponibile: download a runtime fallito (vedi log).');
   browser = await puppeteer.launch({
     headless: 'new',
+    executablePath: exe,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -560,3 +572,10 @@ wss.on('connection', async (ws, req) => {
 
 httpServer.on('error', (err) => console.error('HTTP server error:', err.message));
 httpServer.listen(PORT, () => console.log(`InstaFollowCheck backend su porta ${PORT}`));
+
+// Avvia subito (in background) l'eventuale download di Chrome: sul piano free
+// Render non include la cache di build nell'immagine, quindi al boot va
+// scaricato a runtime. Così quando l'utente apre il tool il browser è pronto.
+ensureChrome()
+  .then((exe) => console.log('Chrome pronto:', exe))
+  .catch((err) => console.error('Chrome preload fallito (verrà ritentato su richiesta):', String((err && err.message) || err)));
