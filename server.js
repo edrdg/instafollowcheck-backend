@@ -8,9 +8,14 @@ const cors = require('cors');
 const { EventEmitter } = require('events');
 const { WebSocketServer } = require('ws');
 const fs = require('fs');
-const puppeteer = require('puppeteer-extra');
+const { addExtra } = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteerCore = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 
+// puppeteer-extra attaccato a puppeteer-core (il browser arriva da
+// @sparticuz/chromium, non scaricato da puppeteer).
+const puppeteer = addExtra(puppeteerCore);
 puppeteer.use(StealthPlugin());
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -93,22 +98,20 @@ app.use(cors({ origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGIN.length
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-// Diagnostica deploy: mostra dove puppeteer cerca Chrome e se esiste.
+// Diagnostica deploy: mostra la build Chromium risolta e se l'eseguibile esiste.
 app.get('/api/debug', requireAuth, async (req, res) => {
   try {
-    const fs = require('fs');
-    const puppeteer = require('puppeteer');
     let exe = null;
-    try { exe = puppeteer.executablePath(); } catch (e) { exe = 'ERR: ' + ((e && e.message) || e); }
-    const cacheDir = process.env.PUPPETEER_CACHE_DIR || null;
+    let err = null;
+    try { exe = await chromeExecutablePath(); } catch (e) { err = String((e && e.message) || e); }
     const check = (p) => (p ? fs.existsSync(p) : null);
     res.json({
-      cacheDir,
-      executablePath: exe,
+      platform: process.platform,
+      sparticuzChromium: chromium.version || require('@sparticuz/chromium/package.json').version,
+      executablePath: exe || null,
       exists: typeof exe === 'string' ? check(exe) : null,
-      home: process.env.HOME || null,
+      error: err,
       cwd: process.cwd(),
-      nodeModules: check(require('path').join(process.cwd(), 'node_modules')),
     });
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
@@ -133,73 +136,44 @@ function broadcast(type, data = {}) {
 }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// Assicura che l'eseguibile di Chrome esista; se manca (es. immagine Render
-// senza la cache di build), lo scarica a runtime prima di lanciare il browser.
-let chromeReady = null;
-async function ensureChrome() {
-  // Se un download è già in corso (o già riuscito), riusa la stessa promessa.
-  if (chromeReady) return chromeReady;
-  chromeReady = (async () => {
-    const pp = require('puppeteer');
-    // NB: puppeteer.executablePath() LANCIA quando il browser manca (non ritorna
-    // un path) — per questo va in try/catch separato e si procede al download.
-    let exe = null;
-    try { exe = pp.executablePath(); } catch (_) { exe = null; }
-    if (exe && fs.existsSync(exe)) return exe;
-    const cacheDir = process.env.PUPPETEER_CACHE_DIR || require('path').join(process.cwd(), 'node_modules', 'puppeteer-cache');
-    console.log('Chrome mancante — download in corso in', cacheDir);
-    const { install } = require('@puppeteer/browsers');
-    let buildId = null;
-    try { buildId = (pp.configuration && pp.configuration.browserRevision) || null; } catch (_) {}
-    if (!buildId) {
-      const revPath = require('path').join(process.cwd(), 'node_modules', 'puppeteer-core', 'lib', 'cjs', 'puppeteer', 'revisions.js');
-      try {
-        const m = fs.readFileSync(revPath, 'utf8').match(/chrome\s*:\s*'([^']+)'/);
-        if (m) buildId = m[1];
-      } catch (_) {}
-    }
-    if (!buildId) {
-      const { resolveBuildId } = require('@puppeteer/browsers');
-      buildId = await resolveBuildId('chrome', 'linux', 'latest');
-    }
-    console.log('ensureChrome: buildId =', buildId);
-    // @puppeteer/browsers install() NON riscarica se la cartella della build
-    // esiste ma l'eseguibile manca (download parziale finito nell'immagine).
-    // In quel caso pulisci la cache e riparti da zero.
-    const exePath = require('path').join(cacheDir, 'chrome', `linux-${buildId}`, 'chrome-linux64', 'chrome');
-    if (fs.existsSync(cacheDir) && !fs.existsSync(exePath)) {
-      console.log('ensureChrome: cache parziale/corrotta — pulizia di', cacheDir);
-      fs.rmSync(cacheDir, { recursive: true, force: true });
-    }
-    const installed = await install({
-      browser: 'chrome',
-      buildId,
-      cacheDir,
-      baseUrl: 'https://storage.googleapis.com/chrome-for-testing-public',
-    });
-    console.log('ensureChrome: installato a', installed.executablePath, '| exists =', fs.existsSync(installed.executablePath));
-    return installed.executablePath;
-  })();
-  chromeReady.catch((err) => {
-    console.error('ensureChrome error:', String((err && err.message) || err));
-    chromeReady = null; // consente un nuovo tentativo al prossimo giro
-  });
-  return chromeReady;
+// Percorso del browser Chromium. In produzione (linux / Render) si usa la
+// build @sparticuz/chromium: binario ottimizzato per ambienti serverless e
+// con poca RAM (il piano free di Render ha 512 MB), già incluso nelle
+// dipendenze npm — niente download a runtime, niente Docker. In locale su
+// mac/windows quella build è linux-only, quindi si ripiega su un Chrome di
+// sistema (o su CHROME_PATH).
+async function chromeExecutablePath() {
+  if (process.platform === 'linux') {
+    try {
+      const exe = await chromium.executablePath();
+      if (fs.existsSync(exe)) return exe;
+    } catch (_) {}
+  }
+  const candidates = [
+    process.env.CHROME_PATH,
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ].filter(Boolean);
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  throw new Error('Browser non trovato: in produzione si usa la build @sparticuz/chromium; in locale installa Google Chrome oppure imposta CHROME_PATH.');
 }
 
 async function getBrowser() {
   if (browser && browser.connected) return browser;
-  const exe = await ensureChrome();
-  if (!exe) throw new Error('Chrome non disponibile: download a runtime fallito (vedi log).');
+  // Flag gia' inclusi nella build leggera (--no-sandbox, --disable-dev-shm-usage,
+  // --single-process, ...). Togliamo --headless: lo gestisce puppeteer con
+  // headless: true (new headless, compatibile con lo screencast CDP dell'embed).
+  const args = chromium.args.filter((a) => !a.startsWith('--headless'));
   browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: exe,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-    ],
+    headless: true,
+    executablePath: await chromeExecutablePath(),
+    args: [...args, '--disable-blink-features=AutomationControlled'],
     defaultViewport: { width: 1100, height: 760 },
   });
   page = await browser.newPage();
@@ -580,10 +554,3 @@ wss.on('connection', async (ws, req) => {
 
 httpServer.on('error', (err) => console.error('HTTP server error:', err.message));
 httpServer.listen(PORT, () => console.log(`InstaFollowCheck backend su porta ${PORT}`));
-
-// Avvia subito (in background) l'eventuale download di Chrome: sul piano free
-// Render non include la cache di build nell'immagine, quindi al boot va
-// scaricato a runtime. Così quando l'utente apre il tool il browser è pronto.
-ensureChrome()
-  .then((exe) => console.log('Chrome pronto:', exe))
-  .catch((err) => console.error('Chrome preload fallito (verrà ritentato su richiesta):', String((err && err.message) || err)));
